@@ -1,0 +1,168 @@
+
+================================================================================
+                    PROJEKTPLAN - NodeMCU V3 SENSOR DASHBOARD
+                    Uni Kurs: Web Science | Zeitaufwand: ~4h
+================================================================================
+
+ÜBERSICHT
+---------
+Dieses Projekt implementiert einen Umgebungssensor auf Basis des NodeMCU V3
+(ESP8266MOD), der folgende Daten erfasst und in Echtzeit auf einem Web-
+Dashboard visualisiert:
+
+    SENSOREN:
+    ---------
+    • AM2302 (DHT22): Raumtemperatur & Luftfeuchtigkeit (GPIO 14 / D5)
+    • ADC (A0): Analoger Sensor (z.B. Licht, Potentiometer, NTC)
+    • WiFi RSSI: Signalstärke des verbundenen WLANs
+
+    BESONDERHEIT - WLAN-PRÄSENZERKENNUNG:
+    --------------------------------------
+    Ohne zusätzliche Hardware! Der NodeMCU nutzt die Schwankungen der
+    RSSI-Signalstärke (WiFi), um Bewegungen/Präsenz im Raum zu erkennen.
+
+    Prinzip: Menschliche Körper stören 2,4 GHz-Signale durch Absorption
+    und Multipath-Propagation. Dies führt zu messbaren RSSI-Schwankungen,
+    deren Varianz (Standardabweichung) als Präsenz-Indikator dient.
+
+    WICHTIGER UNTERSCHIED ZUM ESP32:
+    ---------------------------------
+    Der NodeMCU V3 (ESP8266) hat KEINE internen Sensoren wie:
+    • Hall-Sensor (nicht vorhanden)
+    • Touch-Sensor (nicht vorhanden)
+    • Chip-Temperatursensor (nicht vorhanden)
+
+    Dafür ist der NodeMCU günstiger (~5-8 EUR vs. ~8-12 EUR) und hat einen
+    eingebauten USB-Seriell-Wandler (CH340), was die Programmierung erleichtert.
+
+    DASHBOARD:
+    ----------
+    • 6 Live-Charts mit Chart.js
+    • Dark-Mode UI
+    • SSE (Server-Sent Events) für Echtzeit-Updates
+    • Responsive Design (Mobile & Desktop)
+
+ZEITPLAN (Gesamt: ~4 Stunden)
+-------------------------------
+
+    PHASE 1: HARDWARE (30 Min.)
+    =============================
+    [ ] NodeMCU V3, AM2302, Breadboard, Kabel bereitlegen
+    [ ] AM2302 an D5 (GPIO 14), 3V3, GND anschließen
+    [ ] Optional: Analog-Sensor an A0 anschließen
+    [ ] USB-Verbindung testen
+    [ ] Seriellen Monitor öffnen (115200 Baud)
+
+    PHASE 2: SOFTWARE-SETUP (45 Min.)
+    ==================================
+    [ ] Arduino IDE oder VS Code + PlatformIO installieren
+    [ ] ESP8266 Board-Support installieren:
+        Arduino IDE: Datei → Voreinstellungen → Zusätzliche Board-Manager-URLs:
+        http://arduino.esp8266.com/stable/package_esp8266com_index.json
+        Dann: Werkzeuge → Board → Board-Verwalter → "esp8266" suchen
+    [ ] Libraries installieren:
+        • ESPAsyncWebServer by ESP32Async
+        • ESPAsyncTCP by ESP32Async
+        • DHT sensor library by Adafruit
+        • Arduino_JSON by bblanchon
+    [ ] WLAN-Zugangsdaten im Code eintragen
+    [ ] Ersten Upload durchführen
+
+    PHASE 3: SENSOREN TESTEN (30 Min.)
+    ===================================
+    [ ] Serielle Ausgabe prüfen (alle Werte sichtbar?)
+    [ ] AM2302: Hände wärmen, Werte prüfen
+    [ ] ADC: Potentiometer drehen oder Lichtsensor abdecken
+    [ ] RSSI-Werte prüfen (sollte zwischen -30 und -80 dBm liegen)
+
+    PHASE 4: WEB-DASHBOARD TESTEN (30 Min.)
+    ========================================
+    [ ] IP-Adresse im Browser öfffen
+    [ ] Alle 6 Charts sichtbar?
+    [ ] Werte aktualisieren sich alle 2 Sekunden?
+    [ ] Mobile Ansicht testen (Handy)
+    [ ] Mehrere Browser-Tabs gleichzeitig öffnen
+
+    PHASE 5: PRÄSENZERKENNUNG KALIBRIEREN (20 Min.)
+    =================================================
+    [ ] Raum verlassen, 60 Sek. warten (30 Werte × 2 Sek.)
+    [ ] Kalibrierung abgeschlossen?
+    [ ] Im Raum bewegen → Präsenz-Status ändert sich?
+    [ ] Faktor PRESENCE_FACTOR anpassen (1.1 - 1.5)
+
+    PHASE 6: DOKUMENTATION & ABGAE (45 Min.)
+    =========================================
+    [ ] Screenshots vom Dashboard erstellen
+    [ ] Schaltplan zeichnen (Fritzing oder handschriftlich)
+    [ ] Kurzbeschreibung der Technologien schreiben
+    [ ] Quellcode kommentieren
+    [ ] Video-Demo aufnehmen (optional, aber empfohlen)
+
+ARCHITEKTUR-DIAGRAMM (Text)
+----------------------------
+
+    ┌─────────────┐      HTTP/SSE       ┌─────────────────────────────┐
+    │   BROWSER   │◄───────────────────►│  NodeMCU V3 (ESP8266MOD)    │
+    │  (Chart.js) │                     │  ┌─────────────────────┐    │
+    │  (Dark UI)  │                     │  │ AsyncWebServer:80   │    │
+    └─────────────┘                     │  │  - / → Dashboard    │    │
+                                        │  │  - /events → SSE    │    │
+                                        │  └─────────────────────┘    │
+                                        │  ┌─────────────────────┐    │
+                                        │  │ Sensor-Loop (2s)    │    │
+                                        │  │  AM2302 → GPIO 14   │    │
+                                        │  │  ADC    → A0        │    │
+                                        │  │  RSSI   → WiFi      │    │
+                                        │  │  Präsenz→ Varianz   │    │
+                                        │  └─────────────────────┘    │
+                                        │         WiFi (STA)          │
+                                        └─────────────────────────────┘
+
+DATENFLUSS
+----------
+
+    Sensor-Loop (C++)          JSON (String)            Browser (JS)
+    ─────────────────          ─────────────            ────────────
+    dht.readTemp()    ───►    {"roomTemp":22.5,        Chart.js update
+    dht.readHum()     ───►     "humidity":45.2,        DOM update
+    analogRead(A0)    ───►     "adc":512,               Status-Bar
+    WiFi.RSSI()       ───►     "rssi":-42,              
+    calculateStdDev() ───►     "presence":true}        
+                              ──────────────────►      events.onmessage
+
+TECHNOLOGIEN IM ÜBERBLICK
+--------------------------
+
+    EMBEDDED:
+    • C++ / Arduino Framework
+    • ESP8266 Core (nicht ESP32!)
+    • WiFi-Protokoll-Stack (802.11 b/g/n, nur 2.4 GHz)
+
+    NETZWERK:
+    • HTTP/1.1 (Request/Response)
+    • SSE (Server-Sent Events, unidirektional)
+    • JSON (Datenaustauschformat)
+    • TCP/IP (Transport)
+
+    FRONTEND:
+    • HTML5 Semantic Elements
+    • CSS3 Grid & Flexbox
+    • Chart.js (Canvas-basierte Charts)
+    • JavaScript ES6+ (EventSource, DOM API)
+
+    TOOLS:
+    • PlatformIO / Arduino IDE
+    • Serieller Monitor (115200 Baud)
+    • Browser DevTools (Network-Tab für SSE)
+
+BEWERTUNGSKRITERIEN (für den Kurs)
+-----------------------------------
+    [+] Funktionalität: Alle Sensoren messen korrekt
+    [+] Web-Interface: Dashboard ist responsive und übersichtlich
+    [+] Echtzeit: Daten fließen ohne Page-Reload
+    [+] Präsenz: WLAN-basierte Erkennung funktioniert
+    [+] Code-Qualität: Kommentiert, strukturiert, verständlich
+    [+] Dokumentation: Schaltplan, Ablaufdiagramm, Erklärungen
+    [+] Kreativität: Zusätzliche Features (LED, Display, etc.)
+
+================================================================================

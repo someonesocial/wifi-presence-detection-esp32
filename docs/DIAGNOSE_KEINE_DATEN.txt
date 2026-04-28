@@ -1,0 +1,100 @@
+
+================================================================================
+                    DIAGNOSE: KEINE DATEN IM DASHBOARD
+================================================================================
+
+DAS PROBLEM:
+------------
+Das Dashboard laedt (HTML kommt an), aber:
+- Alle Werte zeigen "--"
+- "Verbindung: Verbinden..." bleibt stehen
+- "Prasenz: Kalibrierung..." bleibt stehen
+
+DAS BEDEUTET:
+-------------
+Die SSE-Verbindung (EventSource) funktioniert NICHT.
+Der Browser kann keine Echtzeit-Daten vom NodeMCU empfangen.
+
+WARUM SSE AUF ESP8266 NICHT FUNKTIONIERT:
+==========================================
+
+1. RAM-MANGEL
+-------------
+Der ESP8266 hat nur ~80 KB RAM. 
+Das HTML ist ~6 KB im PROGMEM, aber der AsyncWebServer braucht 
+auch RAM fuer SSE-Verbindungen. Bei zu wenig RAM werden Events 
+einfach nicht gesendet.
+
+2. PROGMEM-STRING PROBLEME
+--------------------------
+Grosse PROGMEM-Strings koennen den ESP8266 blockieren.
+Der R"rawliteral()" Syntax funktioniert manchmal nicht korrekt
+auf dem ESP8266.
+
+3. EVENTSOURCE KOMPATIBILITÄT
+-----------------------------
+Manche Browser/Router blockieren SSE-Verbindungen.
+Besonders im Gastzugang oder mit strikten Firewalls.
+
+LOESUNG: AJAX POLLING
+=====================
+Statt SSE nutzen wir einfaches AJAX Polling:
+- Browser ruft alle 2 Sekunden /api/data auf
+- Server antwortet mit JSON
+- Keine dauerhafte Verbindung noetig
+- Funktioniert auf ALLEM (auch ESP8266)
+
+VORTEILE:
+---------
++ Funktioniert auf ESP8266 (weniger RAM-Verbrauch)
++ Keine Probleme mit Firewalls/Routern
++ Einfacher zu debuggen
++ CORS-freundlich
+
+NACHTEILE:
+----------
+- Etwas mehr Netzwerk-Traffic (jede 2 Sek. ein Request)
+- Nicht ganz so "Echtzeit" wie SSE (aber 2 Sek. sind OK)
+
+================================================================================
+                    WAS HAT SICH GEAENDERT?
+================================================================================
+
+ALT (SSE - funktioniert nicht):
+-------------------------------
+  Server: events.send(json, "newdata", millis());
+  Browser: evtSource = new EventSource('/events');
+           evtSource.addEventListener('newdata', ...);
+
+NEU (AJAX Polling - funktioniert):
+----------------------------------
+  Server: server.on("/api/data", ... request->send(200, "json", json));
+  Browser: setInterval(function() {
+             fetch('/api/data').then(r => r.json()).then(data => {
+               // Daten aktualisieren
+             });
+           }, 2000);
+
+================================================================================
+                    WICHTIGE AENDERUNGEN IM CODE
+================================================================================
+
+1. KEIN AsyncEventSource mehr
+   - Entfernt: AsyncEventSource events("/events");
+   - Entfernt: server.addHandler(&events);
+   - Entfernt: events.send(...);
+
+2. NEU: /api/data Endpunkt
+   - Liefert aktuelle Sensor-Daten als JSON
+   - Wird alle 2 Sekunden vom Browser abgefragt
+
+3. CORS Header hinzugefuegt
+   - Access-Control-Allow-Origin: *
+   - Ermoeglicht Cross-Origin Requests
+
+4. HTML verkleinert
+   - Keine Zeilenumbrueche (spart RAM)
+   - Kein Hinweis-Box mehr
+   - JavaScript auf AJAX umgestellt
+
+================================================================================

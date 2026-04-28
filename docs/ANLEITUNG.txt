@@ -1,0 +1,319 @@
+
+================================================================================
+                    NodeMCU V3 SENSOR DASHBOARD - VOLLSTÄNDIGE ANLEITUNG
+                    Uni Kurs: Web Science | Stand: April 2026
+================================================================================
+
+INHALTSVERZEICHNIS
+------------------
+1. Projektübersicht
+2. Systemarchitektur
+3. Technologie-Stack
+4. Schritt-für-Schritt Anleitung
+5. Netzwerk-Ablauf (Sequenzdiagramm)
+6. Troubleshooting
+7. Erweiterungsmöglichkeiten
+8. ESP8266 vs. ESP32 Vergleich
+
+================================================================================
+1. PROJEKTÜBERSICHT
+================================================================================
+
+Dieses Projekt implementiert einen Umgebungssensor auf Basis des NodeMCU V3
+(ESP8266MOD), der folgende Daten erfasst und in Echtzeit auf einem Web-
+Dashboard visualisiert:
+
+    SENSOREN:
+    ---------
+    • AM2302 (DHT22): Raumtemperatur & Luftfeuchtigkeit (GPIO 14 / D5)
+    • ADC (A0): Analoger Sensor (z.B. Licht, Potentiometer, NTC)
+    • WiFi RSSI: Signalstärke des verbundenen WLANs
+
+    BESONDERHEIT - WLAN-PRÄSENZERKENNUNG:
+    --------------------------------------
+    Ohne zusätzliche Hardware! Der NodeMCU nutzt die Schwankungen der
+    RSSI-Signalstärke (WiFi), um Bewegungen/Präsenz im Raum zu erkennen.
+
+    Prinzip: Menschliche Körper stören 2,4 GHz-Signale durch Absorption
+    und Multipath-Propagation. Dies führt zu messbaren RSSI-Schwankungen,
+    deren Varianz (Standardabweichung) als Präsenz-Indikator dient.
+
+    WICHTIG - KEINE INTERNEN SENSOREN:
+    -----------------------------------
+    Der NodeMCU V3 (ESP8266) hat im Gegensatz zum ESP32 KEINE internen
+    Sensoren. Folgende Features sind daher NICHT verfügbar:
+    • Hall-Sensor (Magnetfeld)
+    • Touch-Sensor (kapazitiv)
+    • Chip-Temperatursensor
+
+    Dafür ist der NodeMCU günstiger und hat einen eingebauten USB-Seriell-
+    Wandler (CH340), was die Programmierung erleichtert.
+
+    DASHBOARD:
+    ----------
+    • 6 Live-Charts mit Chart.js
+    • Dark-Mode UI
+    • SSE (Server-Sent Events) für Echtzeit-Updates
+    • Responsive Design (Mobile & Desktop)
+
+================================================================================
+2. SYSTEMARCHITEKTUR
+================================================================================
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │                      BENUTZER (Browser)                       │
+    │         Ruft NodeMCU-IP auf: http://192.168.x.x             │
+    └──────────────────────┬──────────────────────────────────────┘
+                           │ HTTP GET /
+                           │ SSE: EventSource('/events')
+    ┌──────────────────────▼──────────────────────────────────────┐
+    │                   NodeMCU V3 (ESP8266MOD)                     │
+    │  ┌─────────────────┐    ┌──────────────────────────────┐   │
+    │  │ AsyncWebServer  │◄───┤ Sensor-Loop (alle 2 Sek.)    │   │
+    │  │  Port 80        │    │  • AM2302 (Temp/Hum)         │   │
+    │  │  + HTML inline  │    │  • ADC (A0)                  │   │
+    │  │  + SSE /events  │    │  • RSSI → Präsenz-Varianz    │   │
+    │  │  + /api/data    │    │                              │   │
+    │  └─────────────────┘    └──────────────────────────────┘   │
+    │                      WiFi-Modul (Station Mode, 2.4 GHz)      │
+    └─────────────────────────────────────────────────────────────┘
+
+================================================================================
+3. TECHNOLOGIE-STACK
+================================================================================
+
+    EMBEDDED (NodeMCU V3 / ESP8266):
+    ---------------------------------
+    • Framework:     Arduino (C++)
+    • Board:         NodeMCU 1.0 (ESP-12E Module)
+    • WiFi:          ESP8266WiFi.h (Built-in)
+    • Webserver:     ESPAsyncWebServer + ESPAsyncTCP
+    • Sensoren:      DHT sensor library (Adafruit)
+    • JSON:          Arduino_JSON (bblanchon)
+    • Speicher:      PROGMEM für HTML (Flash statt RAM)
+
+    FRONTEND (Browser):
+    -------------------
+    • HTML5 / CSS3 (Dark Theme, Grid Layout)
+    • Chart.js 4.4.1 (CDN) - 6 Live-Line-Charts
+    • SSE (EventSource API) - Echtzeit-Stream
+    • Kein Backend, keine Datenbank nötig
+
+    KOMMUNIKATION:
+    --------------
+    • Protokoll:     HTTP + SSE (Server-Sent Events)
+    • Datenformat:   JSON
+    • Update-Rate:   Alle 2 Sekunden
+    • Max Clients:   ~3-5 gleichzeitig (ESP8266-Limit)
+
+================================================================================
+4. SCHITT-FÜR-SCHITT ANLEITUNG
+================================================================================
+
+SCHRITT 1: HARDWARE ZUSAMMENBAUEN (15 Min.)
+---------------------------------------------
+    1. AM2302 an NodeMCU anschließen:
+       • VCC (rot)     → 3V3
+       • DATA (gelb)   → D5 (GPIO 14)
+       • GND (schwarz) → GND
+
+    2. Optional: 4.7kΩ Pull-Up zwischen DATA und VCC
+
+    3. Optional: Analog-Sensor an A0 anschließen
+       • Signal → A0
+       • VCC    → 3V3
+       • GND    → GND
+
+    4. NodeMCU per USB mit PC verbinden
+
+SCHRITT 2: SOFTWARE VORBEREITEN (20 Min.)
+------------------------------------------
+    VARIANTE A - Arduino IDE:
+    ~~~~~~~~~~~~~~~~~~~~~~~~~
+    1. Arduino IDE öffnen
+    2. ESP8266 Board-Support installieren:
+       Datei → Voreinstellungen → Zusätzliche Board-Manager-URLs:
+       http://arduino.esp8266.com/stable/package_esp8266com_index.json
+       Dann: Werkzeuge → Board → Board-Verwalter → "esp8266" installieren
+    3. Board auswählen: "NodeMCU 1.0 (ESP-12E Module)"
+    4. Libraries installieren (Sketch → Bibliothek verwalten):
+       • ESPAsyncWebServer by ESP32Async
+       • ESPAsyncTCP by ESP32Async
+       • DHT sensor library by Adafruit
+       • Arduino_JSON by bblanchon
+    5. Datei öffnen: src/nodemcu_sensor_dashboard.ino
+    6. WLAN-Zugangsdaten anpassen (Zeile 18-19)
+    7. COM-Port wählen (CH340 Treiber muss installiert sein!)
+    8. Upload (→)
+
+    VARIANTE B - PlatformIO (VS Code):
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    1. VS Code + PlatformIO Extension installieren
+    2. Projektordner öffnen
+    3. platformio.ini ist bereits konfiguriert für nodemcuv2
+    4. Libraries werden automatisch geladen
+    5. WLAN-Zugangsdaten in src/main.cpp anpassen
+    6. Upload & Monitor: PlatformIO → Upload
+
+SCHRITT 3: ERSTE INBETRIEBNAHME (5 Min.)
+-----------------------------------------
+    1. Seriellen Monitor öffnen (115200 Baud)
+    2. Reset-Taste am NodeMCU drücken
+    3. Ausgabe beobachten:
+       • WLAN-Verbindung wird hergestellt
+       • IP-Adresse wird angezeigt (z.B. 192.168.1.42)
+       • Kalibrierung startet (60 Sek., Raum verlassen!)
+
+    4. Browser öffnen, IP-Adresse eingeben
+    5. Dashboard erscheint mit Live-Daten
+
+SCHRITT 4: PRÄSENZERKENNUNG KALIBRIEREN (1 Min.)
+--------------------------------------------------
+    • Nach dem Boot sammelt der NodeMCU 30 RSSI-Werte (60 Sek.)
+    • WÄHRENDDESSEN: Raum verlassen oder still stehen
+    • Nach Kalibrierung: Bewegung im Raum → Präsenz-LED leuchtet grün
+    • Der Faktor PRESENCE_FACTOR (1.3) kann angepasst werden:
+      - Niedriger (1.1): Empfindlicher, mehr Fehlalarme
+      - Höher (1.5): Robuster, weniger Fehlalarme
+
+SCHRITT 5: DASHBOARD NUTZEN
+-----------------------------
+    • 6 Live-Charts aktualisieren sich alle 2 Sekunden
+    • Letzte 50 Werte werden im Browser gehalten
+    • Status-Bar zeigt Verbindung, RSSI und Präsenz
+    • ADC-Wert ändert sich bei Licht/Potentiometer-Änderung
+
+================================================================================
+5. NETZWERK-ABLAUF (SEQUENZDIAGRAMM)
+================================================================================
+
+    BROWSER                          NodeMCU                        SENSOREN
+      │                                │                               │
+      │───── HTTP GET / ──────────────►│                               │
+      │◄──── HTML + Chart.js ──────────│                               │
+      │                                │                               │
+      │───── EventSource(/events) ────►│                               │
+      │◄──── SSE: event: newdata ──────│                               │
+      │      data: {"temp":22.5,...}   │                               │
+      │                                │                               │
+      │      ╔═════════════════════════╧═══════════════════════════════╗
+      │      ║  LOOP (alle 2 Sek.)                                      ║
+      │      ║  1. dht.readHumidity()  ───────────────────────────────►║
+      │      ║  2. dht.readTemperature() ─────────────────────────────►║
+      │      ║  3. analogRead(A0)      ───────────────────────────────►║
+      │      ║  4. WiFi.RSSI()          ─────────────────────────────►║
+      │      ║  5. StdDev berechnen                                     ║
+      │      ║  6. JSON bauen                                           ║
+      │      ║  7. events.send(json)  ───────────────────────────────►║
+      │      ╚═════════════════════════╤═══════════════════════════════╝
+      │◄──── SSE: event: newdata ──────│
+      │      data: {"temp":22.5,...}   │
+      │                                │
+      │      [wiederholt alle 2 Sek.]  │
+
+================================================================================
+6. TROUBLESHOOTING
+================================================================================
+
+PROBLEM: AM2302 liefert "nan" Werte
+------------------------------------
+    • Kabelverbindung prüfen (DATA auf D5/GPIO 14)
+    • Pull-Up-Widerstand (4.7kΩ) hinzufügen
+    • 3.3V statt 5V verwenden
+    • Mindestens 2 Sekunden zwischen Messungen warten
+
+PROBLEM: NodeMCU wird nicht erkannt (COM-Port nicht sichtbar)
+--------------------------------------------------------------
+    • CH340 Treiber installieren (Windows/Mac/Linux)
+    • Anderes USB-Kabel probieren
+    • Anderen USB-Port probieren
+
+PROBLEM: WLAN-Verbindung schlägt fehl
+--------------------------------------
+    • SSID und Passwort im Code prüfen
+    • 2,4 GHz WLAN verwenden (ESP8266 unterstützt kein 5 GHz!)
+    • Router-Entfernung prüfen
+
+PROBLEM: Dashboard lädt nicht
+------------------------------
+    • Seriellen Monitor prüfen: IP-Adresse notieren
+    • Firewall prüfen (Port 80 muss offen sein im lokalen Netz)
+    • Browser-Cache leeren
+
+PROBLEM: Präsenzerkennung zu unempfindlich
+-------------------------------------------
+    • PRESENCE_FACTOR auf 1.1 oder 1.2 senken
+    • NodeMCU näher an den Bewegungsbereich platzieren
+    • WLAN-Router-Position prüfen (mehr Multipath = besser)
+
+PROBLEM: Upload schlägt fehl
+-----------------------------
+    • Board richtig auswählen: "NodeMCU 1.0 (ESP-12E Module)"
+    • Flash-Modus: DIO (nicht QIO)
+    • Flash-Größe: 4MB (FS:2MB OTA:~1019KB)
+    • Reset-Taste während Upload drücken (manchmal nötig)
+
+================================================================================
+7. ERWEITERUNGSMÖGLICHKEITEN
+================================================================================
+
+    KURZFRISTIG (für bessere Note):
+    --------------------------------
+    • OLED-Display (I2C) für lokale Anzeige der Werte
+    • Relais-Modul zur Steuerung von Geräten (z.B. Lüfter bei hoher Temp)
+    • mDNS: Erreichbar unter http://nodemcu-sensor.local
+    • Mehrere analoge Sensoren über Multiplexer (CD4051)
+
+    LANGFRISTIG (für das Portfolio):
+    ---------------------------------
+    • MQTT-Integration (Home Assistant, Node-RED)
+    • InfluxDB + Grafana für Langzeitspeicherung
+    • OTA-Updates (Over-The-Air Firmware-Updates)
+    • Deep-Sleep für batteriebetriebenen Betrieb
+    • Mehrere NodeMCUs als Mesh-Netzwerk
+
+================================================================================
+8. ESP8266 vs. ESP32 VERGLEICH
+================================================================================
+
+    Feature              | NodeMCU V3 (ESP8266) | ESP32 DevKit
+    ---------------------|----------------------|------------------
+    Prozessor            | Xtensa LX106 80MHz   | Xtensa LX6 240MHz
+    RAM                  | 80 KB                | 520 KB
+    Flash                | 4 MB                 | 4-16 MB
+    WiFi                 | 802.11 b/g/n (2.4GHz)| 802.11 b/g/n (2.4/5GHz)
+    Bluetooth            | Nein                 | Ja (BLE + Classic)
+    Hall-Sensor          | Nein                 | Ja
+    Touch-Sensor         | Nein                 | Ja (10 Pins)
+    Chip-Temp            | Nein                 | Ja
+    ADC                  | 1× (10 Bit, 0-1V)    | 2× (12 Bit, 0-3.3V)
+    DAC                  | Nein                 | 2× (8 Bit)
+    GPIOs                | 17                   | 34
+    Preis                | ~5-8 EUR             | ~8-12 EUR
+    USB-Chip             | CH340 (eingebaut)    | CP2102/CH340
+
+    EMPFEHLUNG:
+    -----------
+    • ESP8266 (NodeMCU): Günstiger, einfacher, für dieses Projekt ausreichend
+    • ESP32: Mehr Power, mehr Sensoren, besser für komplexe Projekte
+
+================================================================================
+                              GUTSCHEIN / QUICK-START
+================================================================================
+
+Schnellstart-Befehle (nach Upload):
+------------------------------------
+    1. Serieller Monitor: 115200 Baud
+    2. IP-Adresse notieren (z.B. 192.168.1.42)
+    3. Browser: http://192.168.1.42
+    4. Fertig!
+
+Wichtige Dateien:
+-----------------
+    • src/main.cpp                          → PlatformIO Version
+    • src/nodemcu_sensor_dashboard.ino      → Arduino IDE Version
+    • platformio.ini                        → PlatformIO Konfiguration
+    • hardware/schematic.txt                → Schaltplan
+    • hardware/BOM.txt                      → Stückliste
+
+================================================================================

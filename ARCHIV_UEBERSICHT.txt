@@ -1,0 +1,36 @@
+
+================================================================================
+                    PROJEKTARCHIV - NodeMCU V3 SENSOR DASHBOARD
+                    FIX: AJAX Polling statt SSE
+================================================================================
+
+VERZEICHNISSTRUKTUR:
+--------------------
+
+wifi-presence-detection-esp32/
+├── src/
+│   ├── main.cpp                              # PlatformIO Version (AJAX)
+│   └── nodemcu_sensor_dashboard
+│       └── nodemcu_sensor_dashboard.ino      # Arduino IDE Version (AJAX)
+├── data/
+│   └── (reserviert)
+├── docs/
+│   ├── ANLEITUNG.txt                         # Vollstaendige Anleitung
+│   ├── PROJEKTPLAN.txt                       # Zeitplan & Architektur
+│   └── DIAGNOSE_KEINE_DATEN.txt              # Warum SSE nicht funktioniert
+├── hardware/
+│   ├── schematic.txt                         # Schaltplan
+│   └── BOM.txt                               # Stueckliste
+└── platformio.ini                            # PlatformIO Konfiguration
+
+WICHTIGE AENDERUNGEN:
+---------------------
+1. SSE (Server-Sent Events) entfernt
+2. AJAX Polling implementiert (fetch alle 2 Sek.)
+3. Hinweis-Box im Dashboard entfernt
+4. HTML kompakt als einzelne Zeile (RAM-Sparen)
+5. CORS Header hinzugefuegt
+
+WARUM KEINE DATEN? -> DIAGNOSE_KEINE_DATEN.txt lesen!
+
+================================================================================

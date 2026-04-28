@@ -1,0 +1,78 @@
+
+================================================================================
+              HARDWARE-SCHALTPLAN - NodeMCU V3 (ESP8266MOD) Sensor Dashboard
+================================================================================
+
+    NodeMCU V3 (ESP8266MOD)
+    +----------------------------------------------------------+
+    |                                                          |
+    |  3V3   o----+-------+                                    |
+    |             |       |                                    |
+    |  GND   o----+-------+-------+                            |
+    |             |       |       |                            |
+    |  D5    o----(DATA)  |       |  <-- GPIO 14               |
+    |  (GPIO14)           |       |                            |
+    |                     |       |                            |
+    |  A0    o------------+       |  <-- Analog Input          |
+    |                             |                            |
+    |  USB   o--------------------+  <-- Strom + Programmierung|
+    |                                                          |
+    +----------------------------------------------------------+
+
+
+    AM2302 (DHT22) Sensor
+    +------------------+
+    |  [VCC]  [DATA]   |
+    |   rot    gelb    |
+    |                  |
+    |   [GND]          |
+    |   schwarz        |
+    +------------------+
+
+
+    VERBINDUNGEN:
+    =============
+    AM2302 VCC (rot)     ----> NodeMCU 3V3
+    AM2302 DATA (gelb)   ----> NodeMCU D5 (GPIO 14)
+    AM2302 GND (schwarz) ----> NodeMCU GND
+
+    Optional: 4.7kΩ Pull-Up zwischen DATA und VCC (auf Breadboard)
+
+
+    ANALOGER SENSOR (optional, z.B. Lichtsensor, Potentiometer, NTC):
+    ==================================================================
+    Sensor Signal ----> NodeMCU A0
+    Sensor VCC    ----> NodeMCU 3V3
+    Sensor GND    ----> NodeMCU GND
+
+    WICHTIG: NodeMCU A0 hat internen Spannungsteiler!
+    Externe Spannung: 0-3.3V (intern auf 0-1V heruntergeteilt)
+    ADC-Auflösung: 10 Bit (0-1023)
+
+
+================================================================================
+                         PIN-BELEGUNG NodeMCU V3
+================================================================================
+
+    NodeMCU Label | GPIO | Funktion           | Status
+    --------------|------|--------------------|------------------
+    D0            | 16   | -                  | Boot-Modus
+    D1            | 5    | -                  | Frei
+    D2            | 4    | -                  | Frei
+    D3            | 0    | -                  | Boot-Modus (Flash)
+    D4            | 2    | -                  | Boot-Modus
+    D5            | 14   | AM2302 DATA        | BELEGT
+    D6            | 12   | -                  | Frei
+    D7            | 13   | -                  | Frei
+    D8            | 15   | -                  | Boot-Modus
+    D9            | 3    | RX                 | UART
+    D10           | 1    | TX                 | UART
+    A0            | A0   | Analog Input       | BELEGT (optional)
+    3V3           | -    | 3.3V Ausgang       | BELEGT
+    GND           | -    | Masse              | BELEGT
+    VIN           | -    | 5V Eingang         | Frei
+
+    BOOT-PINS (NICHT während Boot verändern):
+    GPIO 0, 2, 15 müssen während des Bootens ihren Zustand behalten!
+
+================================================================================
