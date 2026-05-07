@@ -1,268 +1,628 @@
 /*
- * NodeMCU V3 (ESP8266MOD) Sensor Dashboard
- * FIX: AJAX Polling statt SSE (robuster auf ESP8266)
- * Entfernt: Hinweis-Box
- * 
- * Sensoren:
- *   - AM2302 (DHT22): Raumtemperatur & Luftfeuchtigkeit (GPIO 14 / D5)
- *   - ADC (A0): Analoger Sensor
- *   - WiFi RSSI: Signalstärke + Präsenzerkennung
+ * Solar weather station for FireBeetle 2 ESP32-C5 + GY-BME280-3.3.
+ *
+ * Current test behavior:
+ *   1. Stay awake with WiFi and the dashboard online.
+ *   2. Measure the BME280 every 2 seconds.
+ *   3. Prefer 5 GHz WiFi for RSSI presence detection.
+ *   4. Append readings to LittleFS as CSV history.
+ *
+ * For solar deployment, set LOW_POWER_SLEEP to true and change
+ * MEASUREMENT_INTERVAL_SECONDS back to 30.
  */
 
-#include <ESP8266WiFi.h>
-#include <ESPAsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <DHT.h>
-#include <Arduino_JSON.h>
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <Adafruit_BME280.h>
+#include "esp_wifi.h"
 
-// ============== KONFIGURATION ==============
-const char* ssid = "DEIN_WLAN_NAME";
-const char* password = "DEIN_WLAN_PASSWORT";
+// ===================== User configuration =====================
+const char *WIFI_SSID = "DEIN_WLAN_NAME";
+const char *WIFI_PASSWORD = "DEIN_WLAN_PASSWORT";
 
-#define DHTPIN 14       // GPIO 14 = D5 auf NodeMCU
-#define DHTTYPE DHT22
-#define ADC_PIN A0
+static const bool LOW_POWER_SLEEP = false;
+static const bool FORCE_5GHZ_WIFI = true;
 
-#define SENSOR_INTERVAL 2000
-#define PRESENCE_WINDOW 30
-#define PRESENCE_FACTOR 1.3
+static const uint32_t MEASUREMENT_INTERVAL_SECONDS = 2;
+static const uint32_t WEB_WINDOW_MS = 6000;
+static const uint32_t WEB_WINDOW_WHEN_CLIENT_MS = 120000;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 12000;
 
-// ============== GLOBALE VARIABELN ==============
-AsyncWebServer server(80);
-DHT dht(DHTPIN, DHTTYPE);
+static const uint16_t MAX_HISTORY_RECORDS = 2880;  // 96 min at 2 s interval
+static const uint16_t COMPACT_MARGIN_RECORDS = 80;
 
-int8_t rssiBuffer[PRESENCE_WINDOW];
-int rssiIndex = 0;
-bool bufferFull = false;
-float baselineStdDev = 0;
-bool isCalibrated = false;
-bool presenceDetected = false;
+static const uint8_t I2C_SDA_PIN = 9;
+static const uint8_t I2C_SCL_PIN = 10;
+static const uint8_t SENSOR_POWER_PIN = 0;  // FireBeetle 3V3_C control
+static const uint8_t BATTERY_ADC_PIN = 1;   // FireBeetle battery detect pin
+static const uint8_t STATUS_LED_PIN = 15;   // FireBeetle onboard LED: 15 / D13
 
-unsigned long lastSensorRead = 0;
+static const uint8_t PRESENCE_WINDOW = 30;
+static const float PRESENCE_FACTOR = 1.30f;
+static const uint8_t PRESENCE_SAMPLES_PER_WAKE = 5;
+static const uint16_t PRESENCE_SAMPLE_INTERVAL_MS = 1000;
 
-float roomTemp = 0, humidity = 0, adcVoltage = 0;
-int adcValue = 0;
-int8_t rssi = 0;
+static const char *HISTORY_PATH = "/weather.csv";
 
-// ============== HTML DASHBOARD (AJAX POLLING) ==============
-const char index_html[] PROGMEM = 
-"<!DOCTYPE html>"
-"<html lang='de'>"
-"<head>"
-"<meta charset='UTF-8'>"
-"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-"<title>NodeMCU V3 Sensor Dashboard</title>"
-"<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js'></script>"
-"<style>"
-"*{box-sizing:border-box;margin:0;padding:0}"
-"body{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#1a1a2e,#16213e);color:#e0e0e0;min-height:100vh;padding:20px}"
-"h1{text-align:center;margin-bottom:10px;color:#00d4ff;font-size:2rem}"
-".subtitle{text-align:center;color:#888;margin-bottom:25px;font-size:.9rem}"
-".status-bar{display:flex;justify-content:center;gap:20px;margin-bottom:25px;flex-wrap:wrap}"
-".status-item{background:rgba(255,255,255,.05);padding:10px 20px;border-radius:20px;font-size:.85rem;border:1px solid rgba(255,255,255,.1)}"
-".status-item .label{color:#888}.status-item .value{color:#00d4ff;font-weight:bold}"
-"#presenceIndicator{display:inline-block;width:12px;height:12px;border-radius:50%;background:#333;margin-left:8px;transition:all .3s}"
-"#presenceIndicator.active{background:#0f8;box-shadow:0 0 12px #0f8}"
-".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px;max-width:1400px;margin:0 auto}"
-".card{background:rgba(255,255,255,.03);border-radius:16px;padding:20px;border:1px solid rgba(255,255,255,.08)}"
-".card h3{font-size:.9rem;color:#aaa;margin-bottom:15px}"
-".current-value{font-size:2rem;font-weight:bold;color:#fff;margin-bottom:10px}"
-".current-value .unit{font-size:1rem;color:#888;font-weight:normal}"
-"canvas{max-height:200px}"
-".footer{text-align:center;margin-top:30px;color:#555;font-size:.8rem}"
-"@media(max-width:600px){h1{font-size:1.4rem}.grid{grid-template-columns:1fr}}"
-"</style>"
-"</head>"
-"<body>"
-"<h1>NodeMCU V3 Sensor Dashboard</h1>"
-"<p class='subtitle'>ESP8266MOD | Echtzeit-Umgebungsmonitoring & WLAN-Prasenzerkennung</p>"
-"<div class='status-bar'>"
-"<div class='status-item'><span class='label'>Verbindung:</span><span class='value' id='connStatus'>Lade...</span></div>"
-"<div class='status-item'><span class='label'>RSSI:</span><span class='value' id='rssiDisplay'>-- dBm</span></div>"
-"<div class='status-item'><span class='label'>Prasenz:</span><span class='value' id='presenceDisplay'>Kalibrierung...</span><span id='presenceIndicator'></span></div>"
-"</div>"
-"<div class='grid'>"
-"<div class='card'><h3>Raumtemperatur (AM2302)</h3><div class='current-value' id='valRoomTemp'>--<span class='unit'> C</span></div><canvas id='chartRoomTemp'></canvas></div>"
-"<div class='card'><h3>Luftfeuchtigkeit (AM2302)</h3><div class='current-value' id='valHumidity'>--<span class='unit'> %</span></div><canvas id='chartHumidity'></canvas></div>"
-"<div class='card'><h3>Analoger Sensor (ADC A0)</h3><div class='current-value' id='valAdc'>--<span class='unit'> /1023</span></div><canvas id='chartAdc'></canvas></div>"
-"<div class='card'><h3>ADC Spannung (A0)</h3><div class='current-value' id='valVoltage'>--<span class='unit'> V</span></div><canvas id='chartVoltage'></canvas></div>"
-"<div class='card'><h3>RSSI & Prasenz</h3><div class='current-value' id='valRssi'>--<span class='unit'> dBm</span></div><canvas id='chartRssi'></canvas></div>"
-"<div class='card'><h3>WiFi Signalqualitat</h3><div class='current-value' id='valQuality'>--<span class='unit'> %</span></div><canvas id='chartQuality'></canvas></div>"
-"</div>"
-"<div class='footer'>NodeMCU V3 (ESP8266MOD) Web Science Projekt | AJAX Polling | Chart.js</div>"
-"<script>"
-"const chartConfig=(l,c,mn,mx)=>({type:'line',data:{labels:[],datasets:[{label:l,data:[],borderColor:c,backgroundColor:c+'20',borderWidth:2,pointRadius:0,pointHoverRadius:4,tension:.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{intersect:false,mode:'index'},plugins:{legend:{display:false}},scales:{x:{display:false},y:{min:mn,max:mx,grid:{color:'rgba(255,255,255,.05)'},ticks:{color:'#888',font:{size:10}}}}}});"
-"const charts={"
-"roomTemp:new Chart(document.getElementById('chartRoomTemp'),chartConfig('C','#ff6b6b',10,40)),"
-"humidity:new Chart(document.getElementById('chartHumidity'),chartConfig('%','#4ecdc4',0,100)),"
-"adc:new Chart(document.getElementById('chartAdc'),chartConfig('Wert','#a8e6cf',0,1023)),"
-"voltage:new Chart(document.getElementById('chartVoltage'),chartConfig('V','#ffe66d',0,1.1)),"
-"rssi:new Chart(document.getElementById('chartRssi'),chartConfig('dBm','#ff8b94',-90,-30)),"
-"quality:new Chart(document.getElementById('chartQuality'),chartConfig('%','#c7ceea',0,100))"
-"};"
-"const MAX_POINTS=50;"
-"function updateChart(ch,v){"
-"const t=new Date();"
-"const tm=t.getHours().toString().padStart(2,'0')+':'+t.getMinutes().toString().padStart(2,'0')+':'+t.getSeconds().toString().padStart(2,'0');"
-"ch.data.labels.push(tm);ch.data.datasets[0].data.push(v);"
-"if(ch.data.labels.length>MAX_POINTS){ch.data.labels.shift();ch.data.datasets[0].data.shift();}"
-"ch.update('none');"
-"}"
-"function rssiToQuality(r){if(r>=-50)return 100;if(r<=-100)return 0;return 2*(r+100);}"
-"const cs=document.getElementById('connStatus');"
-"const pi=document.getElementById('presenceIndicator');"
-"const pd=document.getElementById('presenceDisplay');"
-"const rd=document.getElementById('rssiDisplay');"
-"let lastDataTime=0;"
-"function updateData(){"
-"fetch('/api/data').then(r=>r.json()).then(d=>{"
-"cs.textContent='Verbunden';cs.style.color='#0f8';lastDataTime=Date.now();"
-"document.getElementById('valRoomTemp').innerHTML=d.roomTemp.toFixed(1)+'<span class=\"unit\"> C</span>';"
-"document.getElementById('valHumidity').innerHTML=d.humidity.toFixed(1)+'<span class=\"unit\"> %</span>';"
-"document.getElementById('valAdc').innerHTML=d.adc+'<span class=\"unit\"> /1023</span>';"
-"document.getElementById('valVoltage').innerHTML=d.voltage.toFixed(3)+'<span class=\"unit\"> V</span>';"
-"document.getElementById('valRssi').innerHTML=d.rssi+'<span class=\"unit\"> dBm</span>';"
-"document.getElementById('valQuality').innerHTML=Math.round(rssiToQuality(d.rssi))+'<span class=\"unit\"> %</span>';"
-"rd.textContent=d.rssi+' dBm';"
-"if(d.calibrated){"
-"if(d.presence){pd.textContent='ERKANNT';pd.style.color='#0f8';pi.classList.add('active');}"
-"else{pd.textContent='Keine Bewegung';pd.style.color='#888';pi.classList.remove('active');}"
-"}else{pd.textContent='Kalibrierung... ('+d.calProgress+'%)';pd.style.color='#ffe66d';}"
-"updateChart(charts.roomTemp,d.roomTemp);updateChart(charts.humidity,d.humidity);"
-"updateChart(charts.adc,d.adc);updateChart(charts.voltage,d.voltage);"
-"updateChart(charts.rssi,d.rssi);updateChart(charts.quality,rssiToQuality(d.rssi));"
-"}).catch(e=>{"
-"cs.textContent='Fehler';cs.style.color='#f66';"
-"console.error('Fetch Fehler:',e);"
-"});"
-"}"
-"setInterval(updateData,2000);"
-"updateData();"
-"setInterval(function(){"
-"if(Date.now()-lastDataTime>5000){cs.textContent='Getrennt';cs.style.color='#f66';}"
-"},3000);"
-"</script>"
-"</body>"
-"</html>";
+// Adjust this after measuring VBAT with a multimeter.
+static const float BATTERY_DIVIDER_FACTOR = 2.0f;
 
-// ============== FUNKTIONEN ==============
+// ===================== Runtime state =====================
+WebServer server(80);
+Adafruit_BME280 bme;
 
-float calculateStdDev(int8_t buffer[], int len) {
-    if (len < 2) return 0;
-    float mean = 0;
-    for (int i = 0; i < len; i++) mean += buffer[i];
-    mean /= len;
-    float variance = 0;
-    for (int i = 0; i < len; i++) variance += pow(buffer[i] - mean, 2);
-    return sqrt(variance / len);
+struct WeatherRecord {
+  time_t epoch;
+  float temperature;
+  float humidity;
+  float pressure;
+  float battery;
+  int rssi;
+  float rssiStdDev;
+  bool presence;
+  bool calibrated;
+  uint8_t channel;
+  bool wifiConnected;
+};
+
+WeatherRecord latest = {};
+uint32_t webDeadlineMs = 0;
+uint32_t bootStartedMs = 0;
+
+RTC_DATA_ATTR int8_t rssiBuffer[PRESENCE_WINDOW];
+RTC_DATA_ATTR uint8_t rssiIndex = 0;
+RTC_DATA_ATTR uint8_t rssiSamples = 0;
+RTC_DATA_ATTR bool presenceCalibrated = false;
+RTC_DATA_ATTR float baselineRssiStdDev = 0.0f;
+RTC_DATA_ATTR uint16_t historyRecordsCached = 0;
+RTC_DATA_ATTR uint32_t bootCounter = 0;
+
+// ===================== Helpers =====================
+void beginSerial() {
+  Serial.begin(115200);
+  const uint32_t started = millis();
+  while (!Serial && millis() - started < 5000) {
+    delay(10);
+  }
+  delay(300);
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("FireBeetle 2 ESP32-C5 weather station");
+  Serial.println("Serial OK at 115200 baud");
+  Serial.println("========================================");
+  Serial.flush();
 }
 
-void updatePresence() {
-    rssi = WiFi.RSSI();
-    rssiBuffer[rssiIndex] = rssi;
-    rssiIndex = (rssiIndex + 1) % PRESENCE_WINDOW;
-    if (rssiIndex == 0) bufferFull = true;
-    int samples = bufferFull ? PRESENCE_WINDOW : rssiIndex;
-    if (!isCalibrated) {
-        if (bufferFull) {
-            baselineStdDev = calculateStdDev(rssiBuffer, PRESENCE_WINDOW);
-            isCalibrated = true;
-            Serial.println("[Prasenz] Kalibriert. Baseline: " + String(baselineStdDev));
-        }
-        return;
-    }
-    float currentStdDev = calculateStdDev(rssiBuffer, samples);
-    presenceDetected = (currentStdDev > baselineStdDev * PRESENCE_FACTOR);
+float calculateStdDev(const int8_t *buffer, uint8_t len) {
+  if (len < 2) return 0.0f;
+
+  float mean = 0.0f;
+  for (uint8_t i = 0; i < len; i++) mean += buffer[i];
+  mean /= len;
+
+  float variance = 0.0f;
+  for (uint8_t i = 0; i < len; i++) {
+    const float diff = buffer[i] - mean;
+    variance += diff * diff;
+  }
+  return sqrtf(variance / len);
 }
 
-String buildJSON() {
-    JSONVar doc;
-    doc["roomTemp"] = roomTemp;
-    doc["humidity"] = humidity;
-    doc["adc"] = adcValue;
-    doc["voltage"] = adcVoltage;
-    doc["rssi"] = rssi;
-    doc["presence"] = presenceDetected;
-    doc["calibrated"] = isCalibrated;
-    doc["calProgress"] = bufferFull ? 100 : (rssiIndex * 100 / PRESENCE_WINDOW);
-    return JSON.stringify(doc);
+void sensorPower(bool enabled) {
+  pinMode(SENSOR_POWER_PIN, OUTPUT);
+  digitalWrite(SENSOR_POWER_PIN, enabled ? HIGH : LOW);
+  if (!enabled) {
+    pinMode(I2C_SDA_PIN, INPUT);
+    pinMode(I2C_SCL_PIN, INPUT);
+  }
 }
 
-void readSensors() {
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-    if (!isnan(h) && !isnan(t)) {
-        humidity = h;
-        roomTemp = t;
-    }
-    adcValue = analogRead(ADC_PIN);
-    adcVoltage = adcValue * (3.3 / 1023.0);
-    updatePresence();
+void configure5GHzPreference() {
+  if (!FORCE_5GHZ_WIFI) return;
+
+#if defined(WIFI_BAND_MODE_5G_ONLY)
+  const esp_err_t err = esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY);
+  if (err != ESP_OK) {
+    Serial.printf("5 GHz band mode failed: %s\n", esp_err_to_name(err));
+  } else {
+    Serial.println("WiFi band: 5 GHz only");
+  }
+#else
+  Serial.println("5 GHz band API not available in this Arduino core");
+#endif
 }
 
-// ============== SETUP ==============
+bool connectWiFi() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(LOW_POWER_SLEEP);
+  configure5GHzPreference();
+
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection failed");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.printf("RSSI: %d dBm, channel: %u%s\n",
+                WiFi.RSSI(),
+                WiFi.channel(),
+                WiFi.channel() >= 36 ? " (5 GHz)" : " (2.4 GHz)");
+  return true;
+}
+
+void syncTimeBriefly() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  const uint32_t started = millis();
+  while (time(nullptr) < 1700000000 && millis() - started < 1500) {
+    delay(100);
+  }
+}
+
+float readBatteryVoltage() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  const uint16_t raw = analogRead(BATTERY_ADC_PIN);
+  const float pinVoltage = (raw / 4095.0f) * 3.3f;
+  return pinVoltage * BATTERY_DIVIDER_FACTOR;
+}
+
+bool readBme280(WeatherRecord &record) {
+  sensorPower(true);
+  delay(20);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  bool ok = bme.begin(0x76, &Wire);
+  if (!ok) ok = bme.begin(0x77, &Wire);
+
+  if (!ok) {
+    Serial.println("BME280 not found at 0x76 or 0x77");
+    sensorPower(false);
+    return false;
+  }
+
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::FILTER_OFF);
+  bme.takeForcedMeasurement();
+
+  record.temperature = bme.readTemperature();
+  record.humidity = bme.readHumidity();
+  record.pressure = bme.readPressure() / 100.0f;
+  record.battery = readBatteryVoltage();
+
+  sensorPower(false);
+  return true;
+}
+
+void pushRssiSample(int8_t rssi) {
+  rssiBuffer[rssiIndex] = rssi;
+  rssiIndex = (rssiIndex + 1) % PRESENCE_WINDOW;
+  if (rssiSamples < PRESENCE_WINDOW) rssiSamples++;
+
+  if (!presenceCalibrated && rssiSamples == PRESENCE_WINDOW) {
+    baselineRssiStdDev = calculateStdDev(rssiBuffer, PRESENCE_WINDOW);
+    presenceCalibrated = true;
+    Serial.printf("Presence baseline calibrated: %.2f dBm\n", baselineRssiStdDev);
+  }
+}
+
+void updatePresence(WeatherRecord &record) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  const uint8_t samples = LOW_POWER_SLEEP ? PRESENCE_SAMPLES_PER_WAKE : 1;
+  for (uint8_t i = 0; i < samples; i++) {
+    const int8_t rssi = WiFi.RSSI();
+    pushRssiSample(rssi);
+    record.rssi = rssi;
+    if (i + 1 < samples) delay(PRESENCE_SAMPLE_INTERVAL_MS);
+  }
+
+  record.rssiStdDev = calculateStdDev(rssiBuffer, rssiSamples);
+  record.calibrated = presenceCalibrated;
+  record.presence = presenceCalibrated && baselineRssiStdDev > 0.0f &&
+                    record.rssiStdDev > baselineRssiStdDev * PRESENCE_FACTOR;
+}
+
+uint16_t countHistoryRecords() {
+  File file = LittleFS.open(HISTORY_PATH, "r");
+  if (!file) return 0;
+
+  uint16_t count = 0;
+  while (file.available()) {
+    if (file.read() == '\n') count++;
+  }
+  file.close();
+  return count;
+}
+
+void appendHistory(const WeatherRecord &record) {
+  File file = LittleFS.open(HISTORY_PATH, "a");
+  if (!file) {
+    Serial.println("Could not open history file for append");
+    return;
+  }
+
+  file.printf("%ld,%.2f,%.2f,%.2f,%.2f,%d,%.3f,%u,%u,%u\n",
+              static_cast<long>(record.epoch),
+              record.temperature,
+              record.humidity,
+              record.pressure,
+              record.battery,
+              record.rssi,
+              record.rssiStdDev,
+              record.presence ? 1 : 0,
+              record.calibrated ? 1 : 0,
+              record.channel);
+  file.close();
+  historyRecordsCached++;
+}
+
+void compactHistoryIfNeeded() {
+  if (historyRecordsCached <= MAX_HISTORY_RECORDS + COMPACT_MARGIN_RECORDS) return;
+
+  File in = LittleFS.open(HISTORY_PATH, "r");
+  File out = LittleFS.open("/weather.tmp", "w");
+  if (!in || !out) {
+    if (in) in.close();
+    if (out) out.close();
+    return;
+  }
+
+  const uint16_t skip = historyRecordsCached - MAX_HISTORY_RECORDS;
+  uint16_t line = 0;
+  while (in.available()) {
+    const String row = in.readStringUntil('\n');
+    if (line++ >= skip && row.length() > 0) out.println(row);
+  }
+  in.close();
+  out.close();
+
+  LittleFS.remove(HISTORY_PATH);
+  LittleFS.rename("/weather.tmp", HISTORY_PATH);
+  historyRecordsCached = MAX_HISTORY_RECORDS;
+  Serial.println("History compacted");
+}
+
+String latestJson() {
+  String json;
+  json.reserve(256);
+  json += F("{\"epoch\":");
+  json += static_cast<long>(latest.epoch);
+  json += F(",\"temperature\":");
+  json += String(latest.temperature, 2);
+  json += F(",\"humidity\":");
+  json += String(latest.humidity, 2);
+  json += F(",\"pressure\":");
+  json += String(latest.pressure, 2);
+  json += F(",\"battery\":");
+  json += String(latest.battery, 2);
+  json += F(",\"rssi\":");
+  json += latest.rssi;
+  json += F(",\"rssiStdDev\":");
+  json += String(latest.rssiStdDev, 3);
+  json += F(",\"presence\":");
+  json += (latest.presence ? F("true") : F("false"));
+  json += F(",\"calibrated\":");
+  json += (latest.calibrated ? F("true") : F("false"));
+  json += F(",\"channel\":");
+  json += latest.channel;
+  json += F(",\"wifiConnected\":");
+  json += (latest.wifiConnected ? F("true") : F("false"));
+  json += F(",\"baselineStdDev\":");
+  json += String(baselineRssiStdDev, 3);
+  json += F(",\"historyRecords\":");
+  json += historyRecordsCached;
+  json += F("}");
+  return json;
+}
+
+void streamHistoryJson() {
+  File file = LittleFS.open(HISTORY_PATH, "r");
+  if (!file) {
+    server.send(200, "application/json", "[]");
+    return;
+  }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent("[");
+  bool first = true;
+  while (file.available()) {
+    const String row = file.readStringUntil('\n');
+    if (row.length() < 10) continue;
+
+    long epoch;
+    float t, h, p, b, stddev;
+    int rssi;
+    unsigned int presence, calibrated, channel;
+    const int parsed = sscanf(row.c_str(), "%ld,%f,%f,%f,%f,%d,%f,%u,%u,%u",
+                              &epoch, &t, &h, &p, &b, &rssi, &stddev,
+                              &presence, &calibrated, &channel);
+    if (parsed != 10) continue;
+
+    if (!first) server.sendContent(",");
+    first = false;
+    String item;
+    item.reserve(128);
+    item += F("{\"e\":");
+    item += epoch;
+    item += F(",\"t\":");
+    item += String(t, 2);
+    item += F(",\"h\":");
+    item += String(h, 2);
+    item += F(",\"p\":");
+    item += String(p, 2);
+    item += F(",\"b\":");
+    item += String(b, 2);
+    item += F(",\"r\":");
+    item += rssi;
+    item += F(",\"s\":");
+    item += String(stddev, 3);
+    item += F(",\"m\":");
+    item += (presence ? F("1") : F("0"));
+    item += F(",\"c\":");
+    item += (calibrated ? F("1") : F("0"));
+    item += F(",\"ch\":");
+    item += channel;
+    item += '}';
+    server.sendContent(item);
+  }
+  file.close();
+  server.sendContent("]");
+  server.sendContent("");
+}
+
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Solar Wetterstation</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{color-scheme:dark;--bg:#101419;--panel:#171e25;--line:#2b3642;--text:#e8edf2;--muted:#8d9aa7;--green:#58d68d;--red:#ff6b6b;--blue:#6cb6ff;--yellow:#ffd166}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+header{padding:18px 18px 10px;border-bottom:1px solid var(--line)}h1{margin:0 0 6px;font-size:1.4rem;font-weight:650}.sub{color:var(--muted);font-size:.9rem}
+main{padding:16px;max-width:1200px;margin:auto}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;min-height:86px}.metric span{display:block;color:var(--muted);font-size:.78rem}.metric strong{display:block;font-size:1.45rem;margin-top:8px}
+.presence strong{color:var(--green)}.presence.off strong{color:var(--muted)}.chart{height:260px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px}.pill{border:1px solid var(--line);border-radius:999px;padding:6px 10px;color:var(--muted);font-size:.84rem}
+button{border:1px solid var(--line);background:#1e2933;color:var(--text);border-radius:6px;padding:8px 10px;cursor:pointer}button:hover{background:#263442}
+</style>
+</head>
+<body>
+<header><h1>Solar Wetterstation</h1><div class="sub">FireBeetle 2 ESP32-C5 · BME280 · 5 GHz RSSI-Präsenzerkennung</div></header>
+<main>
+<div class="metrics">
+<div class="metric"><span>Temperatur</span><strong id="temp">--</strong></div>
+<div class="metric"><span>Luftfeuchte</span><strong id="hum">--</strong></div>
+<div class="metric"><span>Luftdruck</span><strong id="press">--</strong></div>
+<div class="metric"><span>Batterie</span><strong id="bat">--</strong></div>
+<div class="metric"><span>RSSI</span><strong id="rssi">--</strong></div>
+<div class="metric presence off" id="presenceBox"><span>Präsenz</span><strong id="presence">--</strong></div>
+</div>
+<div class="row">
+<span class="pill" id="status">Lade Daten...</span>
+<span class="pill" id="samples">-- Messpunkte</span>
+<span class="pill" id="channel">--</span>
+<button onclick="loadData()">Aktualisieren</button>
+</div>
+<div class="chart"><canvas id="weatherChart"></canvas></div>
+<div class="chart"><canvas id="presenceChart"></canvas></div>
+</main>
+<script>
+let weatherChart,presenceChart;
+const fmtTime=e=>e>1700000000?new Date(e*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'Boot '+e;
+function makeChart(id,datasets,yTitle){
+  return new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets},options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#cbd5df'}}},scales:{x:{ticks:{color:'#8d9aa7',maxTicksLimit:8},grid:{color:'#26313c'}},y:{title:{display:true,text:yTitle,color:'#8d9aa7'},ticks:{color:'#8d9aa7'},grid:{color:'#26313c'}}}}});
+}
+async function loadData(){
+  const [latest,history]=await Promise.all([fetch('/api/latest').then(r=>r.json()),fetch('/api/history').then(r=>r.json())]);
+  temp.textContent=latest.temperature.toFixed(1)+' °C'; hum.textContent=latest.humidity.toFixed(0)+' %'; press.textContent=latest.pressure.toFixed(0)+' hPa';
+  bat.textContent=latest.battery.toFixed(2)+' V'; rssi.textContent=latest.rssi+' dBm';
+  presence.textContent=latest.calibrated?(latest.presence?'Erkannt':'Nein'):'Kalibriert...';
+  presenceBox.classList.toggle('off',!latest.presence);
+  status.textContent=latest.wifiConnected?'WLAN verbunden':'WLAN offline';
+  samples.textContent=history.length+' Messpunkte';
+  channel.textContent='Kanal '+latest.channel+(latest.channel>=36?' · 5 GHz':' · 2.4 GHz');
+  const labels=history.map(x=>fmtTime(x.e));
+  if(!weatherChart){
+    weatherChart=makeChart('weatherChart',[
+      {label:'°C',data:[],borderColor:'#ff6b6b',pointRadius:0,yAxisID:'y'},
+      {label:'% rF',data:[],borderColor:'#58d68d',pointRadius:0,yAxisID:'y'},
+      {label:'hPa / 10',data:[],borderColor:'#6cb6ff',pointRadius:0,yAxisID:'y'}
+    ],'Wetter');
+    presenceChart=makeChart('presenceChart',[
+      {label:'RSSI dBm',data:[],borderColor:'#ffd166',pointRadius:0},
+      {label:'StdDev',data:[],borderColor:'#c792ea',pointRadius:0},
+      {label:'Präsenz',data:[],borderColor:'#58d68d',stepped:true,pointRadius:0}
+    ],'RSSI / Präsenz');
+  }
+  weatherChart.data.labels=labels;
+  weatherChart.data.datasets[0].data=history.map(x=>x.t);
+  weatherChart.data.datasets[1].data=history.map(x=>x.h);
+  weatherChart.data.datasets[2].data=history.map(x=>x.p/10);
+  presenceChart.data.labels=labels;
+  presenceChart.data.datasets[0].data=history.map(x=>x.r);
+  presenceChart.data.datasets[1].data=history.map(x=>x.s);
+  presenceChart.data.datasets[2].data=history.map(x=>x.m?0:-100);
+  weatherChart.update(); presenceChart.update();
+}
+loadData(); setInterval(loadData,2000);
+</script>
+</body>
+</html>
+)HTML";
+
+void handleRoot() {
+  webDeadlineMs = millis() + WEB_WINDOW_WHEN_CLIENT_MS;
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleLatest() {
+  webDeadlineMs = millis() + WEB_WINDOW_WHEN_CLIENT_MS;
+  server.send(200, "application/json", latestJson());
+}
+
+void handleHistory() {
+  webDeadlineMs = millis() + WEB_WINDOW_WHEN_CLIENT_MS;
+  streamHistoryJson();
+}
+
+void startWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/latest", HTTP_GET, handleLatest);
+  server.on("/api/history", HTTP_GET, handleHistory);
+  server.begin();
+  webDeadlineMs = millis() + WEB_WINDOW_MS;
+  Serial.println("Webserver started");
+  Serial.print("Open dashboard: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/");
+}
+
+void enterSleep() {
+  server.stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  sensorPower(false);
+
+  const uint32_t awakeSeconds = (millis() - bootStartedMs + 999) / 1000;
+  const uint32_t sleepSeconds =
+      awakeSeconds >= MEASUREMENT_INTERVAL_SECONDS ? 1 : MEASUREMENT_INTERVAL_SECONDS - awakeSeconds;
+
+  Serial.printf("Deep sleep for %lu s\n", static_cast<unsigned long>(sleepSeconds));
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepSeconds) * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n=== NodeMCU V3 Sensor Dashboard ===");
-    Serial.println("(ESP8266MOD) - AJAX Polling Version");
+  bootStartedMs = millis();
+  bootCounter++;
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, HIGH);
+  beginSerial();
+  Serial.printf("\nSolar Wetterstation boot #%lu\n", static_cast<unsigned long>(bootCounter));
+  Serial.println("If you can read this, the uploaded sketch is running.");
 
-    dht.begin();
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed");
+  } else if (historyRecordsCached == 0) {
+    historyRecordsCached = countHistoryRecords();
+  }
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
+  latest = {};
+  latest.epoch = bootCounter;
+  const bool bmeOk = readBme280(latest);
+  latest.wifiConnected = connectWiFi();
 
-    Serial.print("WLAN-Verbindung");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\nIP: " + WiFi.localIP().toString());
+  if (latest.wifiConnected) {
+    syncTimeBriefly();
+    const time_t now = time(nullptr);
+    if (now > 1700000000) latest.epoch = now;
+    latest.channel = WiFi.channel();
+    latest.rssi = WiFi.RSSI();
+    updatePresence(latest);
+  }
 
-    // CORS Header fuer AJAX
-    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
-    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, PUT");
-    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (bmeOk) {
+    appendHistory(latest);
+    compactHistoryIfNeeded();
+  }
 
-    // Web-Root
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send_P(200, "text/html", index_html);
-    });
+  Serial.printf("T %.2f C, H %.2f %%, P %.2f hPa, VBAT %.2f V, RSSI %d dBm, StdDev %.2f, presence %s\n",
+                latest.temperature,
+                latest.humidity,
+                latest.pressure,
+                latest.battery,
+                latest.rssi,
+                latest.rssiStdDev,
+                latest.presence ? "yes" : "no");
 
-    // API-Endpunkt fuer AJAX
-    server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(200, "application/json", buildJSON());
-    });
-
-    server.begin();
-    Serial.println("Webserver gestartet");
-    Serial.println("Kalibrierung: Raum verlassen (60 Sek.)");
+  if (latest.wifiConnected) {
+    startWebServer();
+  } else if (LOW_POWER_SLEEP) {
+    enterSleep();
+  }
 }
 
-// ============== LOOP ==============
 void loop() {
-    if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
-        lastSensorRead = millis();
+  if (latest.wifiConnected) {
+    server.handleClient();
+  }
 
-        readSensors();
+  if (!LOW_POWER_SLEEP) {
+    static uint32_t lastMeasurementMs = 0;
+    static uint32_t lastReconnectMs = 0;
 
-        Serial.print("T:" + String(roomTemp, 1) + " H:" + String(humidity, 1) + " ");
-        Serial.print("ADC:" + String(adcValue) + " V:" + String(adcVoltage, 3) + " ");
-        Serial.print("RSSI:" + String(rssi) + " ");
-        Serial.println("Prasenz:" + String(presenceDetected ? "JA" : "NEIN"));
+    if (!latest.wifiConnected && millis() - lastReconnectMs >= 10000) {
+      lastReconnectMs = millis();
+      latest.wifiConnected = connectWiFi();
+      if (latest.wifiConnected) {
+        syncTimeBriefly();
+        startWebServer();
+      }
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.reconnect();
-    }
-}
- String(roomTemp, 1) + " H:" + String(humidity, 1) + " ");
-        Serial.print("ADC:" + String(adcValue) + " V:" + String(adcVoltage, 3) + " ");
-        Serial.print("RSSI:" + String(rssi) + " ");
-        Serial.println("Prasenz:" + String(presenceDetected ? "JA" : "NEIN"));
-    }
+    if (millis() - lastMeasurementMs >= MEASUREMENT_INTERVAL_SECONDS * 1000UL) {
+      lastMeasurementMs = millis();
+      const bool bmeOk = readBme280(latest);
+      const time_t now = time(nullptr);
+      latest.epoch = now > 1700000000 ? now : bootCounter;
 
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.reconnect();
+      if (latest.wifiConnected) {
+        latest.channel = WiFi.channel();
+        latest.rssi = WiFi.RSSI();
+        if (WiFi.status() != WL_CONNECTED) {
+          latest.wifiConnected = false;
+        } else {
+          updatePresence(latest);
+        }
+      }
+
+      if (bmeOk) {
+        appendHistory(latest);
+        compactHistoryIfNeeded();
+      }
+
+      Serial.printf("T %.2f C, H %.2f %%, P %.2f hPa, VBAT %.2f V, RSSI %d dBm, StdDev %.2f, presence %s, IP %s\n",
+                    latest.temperature,
+                    latest.humidity,
+                    latest.pressure,
+                    latest.battery,
+                    latest.rssi,
+                    latest.rssiStdDev,
+                    latest.presence ? "yes" : "no",
+                    latest.wifiConnected ? WiFi.localIP().toString().c_str() : "offline");
+      digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
     }
+    delay(2);
+    return;
+  }
+
+  if (millis() > webDeadlineMs) {
+    enterSleep();
+  }
+  delay(2);
 }
